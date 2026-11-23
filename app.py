@@ -44,7 +44,11 @@ handler = WebhookHandler(CHANNEL_SECRET)
 KST = ZoneInfo("Asia/Seoul")
 RANKING_STORE_PATH = "/tmp/abyss_rankings.json"
 TARGETS_STORE_PATH = "/tmp/abyss_targets.json"
+# 같은 유저의 연타 도배 방지 최소 간격(초). 0으로 두면 모든 유효 메시지 카운트
+MIN_SPEECH_INTERVAL_SEC = 2.0
+
 state_lock = threading.Lock()
+last_counted_at: dict[str, float] = {}
 
 WELCOME_MSG = (
     "🌊 ━━━ 🐬 𝓐𝓑𝓨𝓢𝓢 🐬 ━━━ 🌊\n"
@@ -102,17 +106,14 @@ targets_data = load_json_dict(TARGETS_STORE_PATH)
 
 def is_valid_counted_message(text: str) -> bool:
     """
-    '/'로 시작하지 않으며, 자음/모음 나열(ㅋㅋㅋ, ㅠㅠ 등)이나 특수문자/숫자 덩어리가 아닌
+    '/'로 시작하지 않으며, 자음/모음 나열(ㅋㅋㅋ, ㅠㅠ 등)이나 기호/이모지가 아닌
     '3글자 이상'의 유효한 단어가 1개 이상 포함된 메시지인지 판별
     """
     stripped = text.strip()
     if not stripped or stripped.startswith("/"):
         return False
 
-    # 공백 기준으로 토큰 분리 후 구두점/이모지/기호 제거
-    tokens = stripped.split()
-    for token in tokens:
-        # 완성형 한글(가-힣) 또는 영문/숫자만 남긴 순수 단어 추출
+    for token in stripped.split():
         cleaned = re.sub(r"[^가-힣A-Za-z0-9]", "", token)
         if len(cleaned) >= 3:
             return True
@@ -362,11 +363,17 @@ def handle_message(event):
         return
 
     if user_id and is_valid_counted_message(user_text):
+        now_ts = time.monotonic()
+        with state_lock:
+            prev_ts = last_counted_at.get(user_id, 0.0)
+            if MIN_SPEECH_INTERVAL_SEC > 0 and (now_ts - prev_ts) < MIN_SPEECH_INTERVAL_SEC:
+                logger.info("[SPEECH] rate-limited user_id=%s text=%r", user_id, user_text)
+                return
+            last_counted_at[user_id] = now_ts
+
         name = get_display_name(event)
         total = add_speech_count(user_id, name, 1)
         logger.info("[SPEECH] counted user_id=%s name=%s total=%d text=%r", user_id, name, total, user_text)
-    else:
-        logger.debug("[SPEECH] ignored text=%r", user_text)
 
 
 if __name__ == "__main__":
