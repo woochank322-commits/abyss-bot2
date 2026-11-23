@@ -356,7 +356,6 @@ def get_sorted_today_entries() -> list[tuple[str, dict]]:
 
         merged_today: dict[str, dict] = {}
 
-        # 상시 멤버 목록에 있는 현재 재실 인원을 기준으로 구성
         for uid, m_info in members_data.items():
             if not uid or not isinstance(m_info, dict):
                 continue
@@ -365,7 +364,6 @@ def get_sorted_today_entries() -> list[tuple[str, dict]]:
                 "madit": 0,
             }
 
-        # 오늘 날짜 기록 중 현재 멤버 목록에 속한 인원의 마디 수 반영
         day_board = ranking_data.get(day, {})
         if isinstance(day_board, dict):
             for uid, info in day_board.items():
@@ -538,45 +536,3 @@ def health_check():
 @app.route("/callback", methods=["POST"])
 def callback():
     ensure_scheduler_started()
-    signature = request.headers.get("X-Line-Signature", "")
-    body = request.get_data(as_text=True)
-
-    try:
-        handler.handle(body, signature)
-    except InvalidSignatureError:
-        logger.warning("[WEBHOOK] InvalidSignatureError on /callback")
-        abort(400)
-    except Exception:
-        logger.exception("[WEBHOOK] unexpected error handling /callback")
-        abort(500)
-
-    return "OK"
-
-
-@handler.add(MemberJoinedEvent)
-def handle_member_joined(event):
-    register_chat_target(event)
-    joined_members = getattr(event.joined, "members", None) or []
-    group_id = getattr(event.source, "group_id", None)
-    room_id = getattr(event.source, "room_id", None)
-    for m in joined_members:
-        uid = getattr(m, "user_id", None)
-        if uid:
-            display_name = get_display_name_by_ids(uid, group_id=group_id, room_id=room_id)
-            ensure_known_member(uid, display_name)
-    reply_messages(event.reply_token, [WELCOME_MSG])
-
-
-@handler.add(MemberLeftEvent)
-def handle_member_left(event):
-    register_chat_target(event)
-    left_members = getattr(event.left, "members", None) or []
-    for m in left_members:
-        uid = getattr(m, "user_id", None)
-        remove_member(uid, remove_today_ranking=True)
-
-
-@handler.add(MessageEvent, message=TextMessageContent)
-def handle_message(event):
-    register_chat_target(event)
-    user
