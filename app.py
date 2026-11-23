@@ -220,4 +220,19 @@ def get_display_name(event) -> str:
 
 
 def upsert_member(user_id: str | None, name: str | None = None):
-    """방에서 인지된 멤버를 상시 멤버 목록에 등록/갱신
+    """방에서 인지된 멤버를 상시 멤버 목록에 등록/갱신"""
+    if not user_id:
+        return
+    with state_lock:
+        latest = load_json_dict(MEMBERS_STORE_PATH)
+        members_data.update(latest)
+        existing = members_data.get(user_id, {})
+        resolved_name = name or existing.get("name") or user_id[-6:]
+        members_data[user_id] = {
+            "name": resolved_name,
+            "updated_at": datetime.now(KST).isoformat(),
+        }
+        save_json_dict(MEMBERS_STORE_PATH, members_data)
+
+
+def remove_member(user_id: str | None
