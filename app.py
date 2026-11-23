@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import re
+import tempfile
 import threading
 import time
 from zoneinfo import ZoneInfo
@@ -88,20 +89,40 @@ def load_json_dict(path: str) -> dict:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
             return data if isinstance(data, dict) else {}
-    except Exception:
+    except Exception as e:
+        logger.warning("[STORE] failed to load %s: %s", path, e)
         return {}
 
 
 def save_json_dict(path: str, data: dict):
+    """임시 파일 기록 후 os.replace()로 원자적 저장"""
+    directory = os.path.dirname(path) or "/tmp"
+    os.makedirs(directory, exist_ok=True)
+    tmp_path = None
     try:
-        with open(path, "w", encoding="utf-8") as f:
+        fd, tmp_path = tempfile.mkstemp(prefix=".tmp_", suffix=".json", dir=directory)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
     except Exception as e:
         logger.warning("[STORE] failed to save %s: %s", path, e)
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
 
 ranking_data = load_json_dict(RANKING_STORE_PATH)
 targets_data = load_json_dict(TARGETS_STORE_PATH)
+
+
+def normalize_command(text: str) -> str:
+    """앞뒤 공백 및 @멘션 토큰 제거 후 첫 명령어 토큰 반환"""
+    tokens = [tok for tok in text.strip().split() if not tok.startswith("@")]
+    return tokens[0] if tokens else ""
 
 
 def is_valid_counted_message(text: str) -> bool:
@@ -136,6 +157,8 @@ def register_chat_target(event):
         return
 
     with state_lock:
+        latest = load_json_dict(TARGETS_STORE_PATH)
+        targets_data.update(latest)
         if target_id not in targets_data:
             targets_data[target_id] = True
             save_json_dict(TARGETS_STORE_PATH, targets_data)
@@ -150,9 +173,11 @@ def get_chat_targets() -> list[str]:
 
 
 def get_display_name(event) -> str:
-    user_id = getattr(event.source, "user_id", None) or "unknown"
-    group_id = getattr(event.source, "group_id", None)
-    room_id = getattr(event.source, "room_id", None)
+    """외부 LINE Profile API 호출 — 반드시 state_lock 밖에서 호출"""
+    source = getattr(event, "source", None)
+    user_id = getattr(source, "user_id", None) or "unknown"
+    group_id = getattr(source, "group_id", None)
+    room_id = getattr(source, "room_id", None)
 
     try:
         with ApiClient(configuration) as api_client:
@@ -169,16 +194,18 @@ def get_display_name(event) -> str:
                 profile = bot_api.get_profile(user_id)
                 if getattr(profile, "display_name", None):
                     return profile.display_name
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("[PROFILE] fallback for user_id=%s: %s", user_id, e)
 
     return user_id[-6:] if user_id != "unknown" else "익명"
 
 
 def add_speech_count(user_id: str, name: str, amount: int = 1) -> int:
-    """오늘 날짜(KST) 기준 유효 발화 횟수 적립"""
+    """이미 조회된 name을 받아 state_lock 안에서만 상태 갱신 및 파일 저장"""
     day = today_key()
     with state_lock:
+        latest = load_json_dict(RANKING_STORE_PATH)
+        ranking_data.update(latest)
         day_board = ranking_data.setdefault(day, {})
         entry = day_board.setdefault(user_id, {"name": name, "madit": 0})
         if name:
@@ -257,14 +284,18 @@ def format_all_ranking(header_prefix: str = "🏆") -> str:
 
 def reply_messages(reply_token: str, texts: list[str]):
     messages = [TextMessage(text=t) for t in texts[:5]]
-    with ApiClient(configuration) as api_client:
-        line_bot_api = MessagingApi(api_client)
-        line_bot_api.reply_message_with_http_info(
-            ReplyMessageRequest(
-                reply_token=reply_token,
-                messages=messages,
+    try:
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            line_bot_api.reply_message_with_http_info(
+                ReplyMessageRequest(
+                    reply_token=reply_token,
+                    messages=messages,
+                )
             )
-        )
+    except Exception:
+        logger.exception("[REPLY] failed to send reply_message (token=%s...)", reply_token[:8])
+        raise
 
 
 def push_hourly_ranking():
@@ -285,8 +316,8 @@ def push_hourly_ranking():
                     )
                 )
                 logger.info("[HOURLY_RANKING] pushed to %s", target_id)
-            except Exception as e:
-                logger.warning("[HOURLY_RANKING] failed to push to %s: %s", target_id, e)
+            except Exception:
+                logger.exception("[HOURLY_RANKING] failed to push to %s", target_id)
 
 
 def hourly_ranking_scheduler_loop():
@@ -332,7 +363,11 @@ def callback():
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
+        logger.warning("[WEBHOOK] InvalidSignatureError on /callback")
         abort(400)
+    except Exception:
+        logger.exception("[WEBHOOK] unexpected error handling /callback")
+        abort(500)
 
     return "OK"
 
@@ -348,17 +383,19 @@ def handle_message(event):
     register_chat_target(event)
     user_text = event.message.text.strip()
     user_id = getattr(event.source, "user_id", None)
+    cmd = normalize_command(user_text)
 
-    if user_text in ("/환찌", "/환츄"):
+    if cmd in ("/환찌", "/환츄"):
         reply_messages(event.reply_token, [HWAN_MSG])
         return
 
-    if user_text == "/내랭킹":
+    if cmd == "/내랭킹":
+        # 닉네임 API 조회는 락 밖에서 수행
         name = get_display_name(event)
         reply_messages(event.reply_token, [format_my_ranking(user_id, name)])
         return
 
-    if user_text == "/전체랭킹":
+    if cmd == "/전체랭킹":
         reply_messages(event.reply_token, [format_all_ranking()])
         return
 
@@ -371,6 +408,7 @@ def handle_message(event):
                 return
             last_counted_at[user_id] = now_ts
 
+        # 외부 닉네임 조회는 락 밖에서 끝낸 뒤, 상태/파일 저장만 락 안에서 실행
         name = get_display_name(event)
         total = add_speech_count(user_id, name, 1)
         logger.info("[SPEECH] counted user_id=%s name=%s total=%d text=%r", user_id, name, total, user_text)
