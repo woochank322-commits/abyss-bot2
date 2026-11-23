@@ -50,6 +50,8 @@ MEMBERS_STORE_PATH = "/tmp/abyss_members.json"
 MIN_SPEECH_INTERVAL_SEC = 2.0
 # 일일 활동부족 경고 기준 마디 수 (30마디 미만 시 경고 표시)
 MIN_ACTIVITY_MADIT = 30
+# 1개 메시지에서 인정되는 유효 단어(3글자 이상)의 최소 길이
+MIN_WORD_LEN = 3
 
 state_lock = threading.Lock()
 last_counted_at: dict[str, float] = {}
@@ -129,21 +131,24 @@ def normalize_command(text: str) -> str:
     return tokens[0] if tokens else ""
 
 
-def is_valid_counted_message(text: str) -> bool:
+def calculate_message_madit(text: str) -> int:
     """
-    '/'로 시작하지 않으며, 자음/모음 나열(ㅋㅋㅋ, ㅠㅠ 등)이나 기호/이모지가 아닌
-    '3글자 이상'의 유효한 단어가 1개 이상 포함된 메시지인지 판별
+    '/'로 시작하지 않는 메시지에서 한글·영문·숫자 기준 3글자 이상인
+    유효 단어의 개수를 마디 수로 계산 (없으면 0 반환)
     """
     stripped = text.strip()
     if not stripped or stripped.startswith("/"):
-        return False
+        return 0
 
+    count = 0
     for token in stripped.split():
+        if token.startswith("@"):
+            continue
         cleaned = re.sub(r"[^가-힣A-Za-z0-9]", "", token)
-        if len(cleaned) >= 3:
-            return True
+        if len(cleaned) >= MIN_WORD_LEN:
+            count += 1
 
-    return False
+    return count
 
 
 def register_chat_target(event):
@@ -312,7 +317,6 @@ def get_sorted_today_entries() -> list[tuple[str, dict]]:
 
         merged_today: dict[str, dict] = {}
 
-        # 1) 상시 멤버 목록의 모든 인원을 기본 0마디로 반영
         for uid, m_info in members_data.items():
             if not uid or not isinstance(m_info, dict):
                 continue
@@ -321,7 +325,6 @@ def get_sorted_today_entries() -> list[tuple[str, dict]]:
                 "madit": 0,
             }
 
-        # 2) 과거 날짜 기록에 있던 멤버도 기본 0마디로 보충
         for date_key, board in sorted(ranking_data.items()):
             if date_key == day or not isinstance(board, dict):
                 continue
@@ -336,7 +339,6 @@ def get_sorted_today_entries() -> list[tuple[str, dict]]:
                 elif info.get("name") and merged_today[uid]["name"] == uid[-6:]:
                     merged_today[uid]["name"] = info.get("name")
 
-        # 3) 오늘 날짜 기록 반영
         day_board = ranking_data.get(day, {})
         if isinstance(day_board, dict):
             for uid, info in day_board.items():
@@ -564,17 +566,26 @@ def handle_message(event):
         reply_messages(event.reply_token, [format_all_ranking()])
         return
 
-    if user_id and is_valid_counted_message(user_text):
-        now_ts = time.monotonic()
-        with state_lock:
-            prev_ts = last_counted_at.get(user_id, 0.0)
-            if MIN_SPEECH_INTERVAL_SEC > 0 and (now_ts - prev_ts) < MIN_SPEECH_INTERVAL_SEC:
-                logger.info("[SPEECH] rate-limited user_id=%s text=%r", user_id, user_text)
-                return
-            last_counted_at[user_id] = now_ts
+    if user_id:
+        gained_madit = calculate_message_madit(user_text)
+        if gained_madit > 0:
+            now_ts = time.monotonic()
+            with state_lock:
+                prev_ts = last_counted_at.get(user_id, 0.0)
+                if MIN_SPEECH_INTERVAL_SEC > 0 and (now_ts - prev_ts) < MIN_SPEECH_INTERVAL_SEC:
+                    logger.info("[SPEECH] rate-limited user_id=%s text=%r", user_id, user_text)
+                    return
+                last_counted_at[user_id] = now_ts
 
-        total = add_speech_count(user_id, name, 1)
-        logger.info("[SPEECH] counted user_id=%s name=%s total=%d text=%r", user_id, name, total, user_text)
+            total = add_speech_count(user_id, name, gained_madit)
+            logger.info(
+                "[SPEECH] counted user_id=%s name=%s +%d (total=%d) text=%r",
+                user_id,
+                name,
+                gained_madit,
+                total,
+                user_text,
+            )
 
 
 if __name__ == "__main__":
