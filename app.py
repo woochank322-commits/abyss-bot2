@@ -47,6 +47,8 @@ RANKING_STORE_PATH = "/tmp/abyss_rankings.json"
 TARGETS_STORE_PATH = "/tmp/abyss_targets.json"
 # 같은 유저의 연타 도배 방지 최소 간격(초). 0으로 두면 모든 유효 메시지 카운트
 MIN_SPEECH_INTERVAL_SEC = 2.0
+# 일일 활동부족 경고 기준 마디 수 (30마디 미만 시 경고 표시)
+MIN_ACTIVITY_MADIT = 30
 
 state_lock = threading.Lock()
 last_counted_at: dict[str, float] = {}
@@ -200,6 +202,31 @@ def get_display_name(event) -> str:
     return user_id[-6:] if user_id != "unknown" else "익명"
 
 
+def ensure_known_member(user_id: str | None, name: str):
+    """오늘 기록이 없더라도 알려진 멤버로 등록해 0마디 미활동자도 랭킹에 포함"""
+    if not user_id:
+        return
+    day = today_key()
+    with state_lock:
+        latest = load_json_dict(RANKING_STORE_PATH)
+        ranking_data.update(latest)
+        day_board = ranking_data.setdefault(day, {})
+        if user_id not in day_board:
+            # 과거 날짜에 기록된 닉네임이 있으면 우선 사용
+            prev_name = name
+            for date_key, board in sorted(ranking_data.items(), reverse=True):
+                if isinstance(board, dict) and user_id in board:
+                    stored_name = board[user_id].get("name")
+                    if stored_name:
+                        prev_name = stored_name
+                        break
+            day_board[user_id] = {"name": prev_name or name or user_id[-6:], "madit": 0}
+            save_json_dict(RANKING_STORE_PATH, ranking_data)
+        elif name:
+            day_board[user_id]["name"] = name
+            save_json_dict(RANKING_STORE_PATH, ranking_data)
+
+
 def add_speech_count(user_id: str, name: str, amount: int = 1) -> int:
     """이미 조회된 name을 받아 state_lock 안에서만 상태 갱신 및 파일 저장"""
     day = today_key()
@@ -216,14 +243,49 @@ def add_speech_count(user_id: str, name: str, amount: int = 1) -> int:
 
 
 def get_sorted_today_entries() -> list[tuple[str, dict]]:
+    """오늘 발언 0마디 인원 및 과거 기록 멤버까지 포함해 오늘 기준 내림차순 정렬"""
     day = today_key()
     with state_lock:
         latest = load_json_dict(RANKING_STORE_PATH)
         ranking_data.update(latest)
+
+        merged_today: dict[str, dict] = {}
+        # 1) 과거 기록에 있던 멤버들을 기본 0마디로 수집
+        for date_key, board in sorted(ranking_data.items()):
+            if date_key == day or not isinstance(board, dict):
+                continue
+            for uid, info in board.items():
+                if isinstance(info, dict):
+                    merged_today.setdefault(
+                        uid,
+                        {
+                            "name": info.get("name") or uid[-6:],
+                            "madit": 0,
+                        },
+                    )
+
+        # 2) 오늘 날짜 보드 반영
         day_board = ranking_data.get(day, {})
-        items = list(day_board.items())
-    items.sort(key=lambda kv: int(kv[1].get("madit", 0)), reverse=True)
+        if isinstance(day_board, dict):
+            for uid, info in day_board.items():
+                if isinstance(info, dict):
+                    prev_name = merged_today.get(uid, {}).get("name") or uid[-6:]
+                    merged_today[uid] = {
+                        "name": info.get("name") or prev_name,
+                        "madit": int(info.get("madit", 0)),
+                    }
+
+        items = list(merged_today.items())
+
+    items.sort(key=lambda kv: (-int(kv[1].get("madit", 0)), str(kv[1].get("name", ""))))
     return items
+
+
+def activity_warning_suffix(madit_count: int) -> str:
+    """30마디 미만인 경우 활동부족 경고 문구 반환"""
+    if madit_count < MIN_ACTIVITY_MADIT:
+        return f" ⚠️ 활동부족({MIN_ACTIVITY_MADIT}마디 미만)"
+    return ""
 
 
 def format_my_ranking(user_id: str | None, fallback_name: str) -> str:
@@ -235,7 +297,8 @@ def format_my_ranking(user_id: str | None, fallback_name: str) -> str:
             f"📊 [{day}] 내 랭킹\n"
             f"• 닉네임: {fallback_name}\n"
             f"• 오늘 발언 수: 0마디\n"
-            f"• 오늘 현재 순위: 기록 없음"
+            f"• 오늘 현재 순위: 기록 없음\n"
+            f"• 상태: ⚠️ 활동부족({MIN_ACTIVITY_MADIT}마디 미만)"
         )
 
     rank = None
@@ -254,14 +317,22 @@ def format_my_ranking(user_id: str | None, fallback_name: str) -> str:
             f"📊 [{day}] 내 랭킹\n"
             f"• 닉네임: {my_name}\n"
             f"• 오늘 발언 수: 0마디\n"
-            f"• 오늘 현재 순위: 기록 없음"
+            f"• 오늘 현재 순위: 기록 없음\n"
+            f"• 상태: ⚠️ 활동부족({MIN_ACTIVITY_MADIT}마디 미만)"
         )
+
+    status_line = (
+        f"⚠️ 활동부족({MIN_ACTIVITY_MADIT}마디 미만)"
+        if my_count < MIN_ACTIVITY_MADIT
+        else "충족"
+    )
 
     return (
         f"📊 [{day}] 내 랭킹\n"
         f"• 닉네임: {my_name}\n"
         f"• 오늘 발언 수: {my_count}마디\n"
-        f"• 오늘 현재 순위: {rank}위 / {len(sorted_items)}명"
+        f"• 오늘 현재 순위: {rank}위 / {len(sorted_items)}명\n"
+        f"• 상태: {status_line}"
     )
 
 
@@ -270,14 +341,20 @@ def format_all_ranking(header_prefix: str = "🏆") -> str:
     sorted_items = get_sorted_today_entries()
 
     if not sorted_items:
-        return f"{header_prefix} [{day}] 전체 랭킹\n아직 오늘 기록된 발언이 없습니다."
+        return (
+            f"{header_prefix} [{day}] 전체 랭킹\n"
+            f"아직 등록된 멤버나 발언 기록이 없습니다."
+        )
 
-    lines = [f"{header_prefix} [{day}] 전체 랭킹"]
+    lines = [
+        f"{header_prefix} [{day}] 전체 랭킹 (기준: {MIN_ACTIVITY_MADIT}마디 이상)"
+    ]
     for idx, (_, info) in enumerate(sorted_items, start=1):
         name = info.get("name") or "멤버"
         count = int(info.get("madit", 0))
         medal = "🥇" if idx == 1 else ("🥈" if idx == 2 else ("🥉" if idx == 3 else f"{idx}."))
-        lines.append(f"{medal} {name} — {count}마디")
+        warning = activity_warning_suffix(count)
+        lines.append(f"{medal} {name} — {count}마디{warning}")
 
     return "\n".join(lines)
 
@@ -390,8 +467,8 @@ def handle_message(event):
         return
 
     if cmd == "/내랭킹":
-        # 닉네임 API 조회는 락 밖에서 수행
         name = get_display_name(event)
+        ensure_known_member(user_id, name)
         reply_messages(event.reply_token, [format_my_ranking(user_id, name)])
         return
 
@@ -408,7 +485,6 @@ def handle_message(event):
                 return
             last_counted_at[user_id] = now_ts
 
-        # 외부 닉네임 조회는 락 밖에서 끝낸 뒤, 상태/파일 저장만 락 안에서 실행
         name = get_display_name(event)
         total = add_speech_count(user_id, name, 1)
         logger.info("[SPEECH] counted user_id=%s name=%s total=%d text=%r", user_id, name, total, user_text)
