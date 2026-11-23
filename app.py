@@ -45,6 +45,7 @@ handler = WebhookHandler(CHANNEL_SECRET)
 KST = ZoneInfo("Asia/Seoul")
 RANKING_STORE_PATH = "/tmp/abyss_rankings.json"
 TARGETS_STORE_PATH = "/tmp/abyss_targets.json"
+MEMBERS_STORE_PATH = "/tmp/abyss_members.json"
 # 같은 유저의 연타 도배 방지 최소 간격(초). 0으로 두면 모든 유효 메시지 카운트
 MIN_SPEECH_INTERVAL_SEC = 2.0
 # 일일 활동부족 경고 기준 마디 수 (30마디 미만 시 경고 표시)
@@ -119,6 +120,7 @@ def save_json_dict(path: str, data: dict):
 
 ranking_data = load_json_dict(RANKING_STORE_PATH)
 targets_data = load_json_dict(TARGETS_STORE_PATH)
+members_data = load_json_dict(MEMBERS_STORE_PATH)
 
 
 def normalize_command(text: str) -> str:
@@ -174,53 +176,106 @@ def get_chat_targets() -> list[str]:
         return list(targets_data.keys())
 
 
-def get_display_name(event) -> str:
+def get_display_name_by_ids(
+    user_id: str | None,
+    group_id: str | None = None,
+    room_id: str | None = None,
+) -> str:
     """외부 LINE Profile API 호출 — 반드시 state_lock 밖에서 호출"""
-    source = getattr(event, "source", None)
-    user_id = getattr(source, "user_id", None) or "unknown"
-    group_id = getattr(source, "group_id", None)
-    room_id = getattr(source, "room_id", None)
-
+    uid = user_id or "unknown"
     try:
         with ApiClient(configuration) as api_client:
             bot_api = MessagingApi(api_client)
-            if group_id and user_id != "unknown":
-                profile = bot_api.get_group_member_profile(group_id, user_id)
+            if group_id and uid != "unknown":
+                profile = bot_api.get_group_member_profile(group_id, uid)
                 if getattr(profile, "display_name", None):
                     return profile.display_name
-            elif room_id and user_id != "unknown":
-                profile = bot_api.get_room_member_profile(room_id, user_id)
+            elif room_id and uid != "unknown":
+                profile = bot_api.get_room_member_profile(room_id, uid)
                 if getattr(profile, "display_name", None):
                     return profile.display_name
-            elif user_id != "unknown":
-                profile = bot_api.get_profile(user_id)
+            elif uid != "unknown":
+                profile = bot_api.get_profile(uid)
                 if getattr(profile, "display_name", None):
                     return profile.display_name
     except Exception as e:
-        logger.debug("[PROFILE] fallback for user_id=%s: %s", user_id, e)
+        logger.debug("[PROFILE] fallback for user_id=%s: %s", uid, e)
 
-    return user_id[-6:] if user_id != "unknown" else "익명"
+    return uid[-6:] if uid != "unknown" else "익명"
+
+
+def get_display_name(event) -> str:
+    """이벤트로부터 발신자 닉네임 조회 — 반드시 state_lock 밖에서 호출"""
+    source = getattr(event, "source", None)
+    user_id = getattr(source, "user_id", None)
+    group_id = getattr(source, "group_id", None)
+    room_id = getattr(source, "room_id", None)
+    return get_display_name_by_ids(user_id=user_id, group_id=group_id, room_id=room_id)
+
+
+def upsert_member(user_id: str | None, name: str | None = None):
+    """방에서 인지된 멤버를 상시 멤버 목록에 등록/갱신"""
+    if not user_id:
+        return
+    with state_lock:
+        latest = load_json_dict(MEMBERS_STORE_PATH)
+        members_data.update(latest)
+        existing = members_data.get(user_id, {})
+        resolved_name = name or existing.get("name") or user_id[-6:]
+        members_data[user_id] = {
+            "name": resolved_name,
+            "updated_at": datetime.now(KST).isoformat(),
+        }
+        save_json_dict(MEMBERS_STORE_PATH, members_data)
+
+
+def sync_group_members_from_api():
+    """가능한 경우 그룹 멤버 ID 목록을 조회해 미등록 멤버(0마디)도 보충"""
+    targets = get_chat_targets()
+    group_ids = [tid for tid in targets if isinstance(tid, str) and tid.startswith("C")]
+    if not group_ids:
+        return
+
+    with state_lock:
+        latest = load_json_dict(MEMBERS_STORE_PATH)
+        members_data.update(latest)
+        known_ids = set(members_data.keys())
+
+    for gid in group_ids:
+        start_token = None
+        while True:
+            try:
+                with ApiClient(configuration) as api_client:
+                    bot_api = MessagingApi(api_client)
+                    res = bot_api.get_group_members_ids(gid, start=start_token)
+            except Exception as e:
+                logger.debug("[MEMBERS_SYNC] skipped get_group_members_ids for %s: %s", gid, e)
+                break
+
+            member_ids = getattr(res, "member_ids", None) or []
+            for uid in member_ids:
+                if uid and uid not in known_ids:
+                    display_name = get_display_name_by_ids(uid, group_id=gid)
+                    upsert_member(uid, display_name)
+                    known_ids.add(uid)
+
+            start_token = getattr(res, "next", None)
+            if not start_token:
+                break
 
 
 def ensure_known_member(user_id: str | None, name: str):
     """오늘 기록이 없더라도 알려진 멤버로 등록해 0마디 미활동자도 랭킹에 포함"""
     if not user_id:
         return
+    upsert_member(user_id, name)
     day = today_key()
     with state_lock:
         latest = load_json_dict(RANKING_STORE_PATH)
         ranking_data.update(latest)
         day_board = ranking_data.setdefault(day, {})
         if user_id not in day_board:
-            # 과거 날짜에 기록된 닉네임이 있으면 우선 사용
-            prev_name = name
-            for date_key, board in sorted(ranking_data.items(), reverse=True):
-                if isinstance(board, dict) and user_id in board:
-                    stored_name = board[user_id].get("name")
-                    if stored_name:
-                        prev_name = stored_name
-                        break
-            day_board[user_id] = {"name": prev_name or name or user_id[-6:], "madit": 0}
+            day_board[user_id] = {"name": name or user_id[-6:], "madit": 0}
             save_json_dict(RANKING_STORE_PATH, ranking_data)
         elif name:
             day_board[user_id]["name"] = name
@@ -229,6 +284,7 @@ def ensure_known_member(user_id: str | None, name: str):
 
 def add_speech_count(user_id: str, name: str, amount: int = 1) -> int:
     """이미 조회된 name을 받아 state_lock 안에서만 상태 갱신 및 파일 저장"""
+    upsert_member(user_id, name)
     day = today_key()
     with state_lock:
         latest = load_json_dict(RANKING_STORE_PATH)
@@ -243,37 +299,55 @@ def add_speech_count(user_id: str, name: str, amount: int = 1) -> int:
 
 
 def get_sorted_today_entries() -> list[tuple[str, dict]]:
-    """오늘 발언 0마디 인원 및 과거 기록 멤버까지 포함해 오늘 기준 내림차순 정렬"""
+    """
+    방 안에서 인지된 모든 인원(오늘 0마디 포함)을 합쳐 오늘 발언 수 기준 내림차순 정렬
+    """
     day = today_key()
     with state_lock:
-        latest = load_json_dict(RANKING_STORE_PATH)
-        ranking_data.update(latest)
+        latest_rank = load_json_dict(RANKING_STORE_PATH)
+        ranking_data.update(latest_rank)
+
+        latest_members = load_json_dict(MEMBERS_STORE_PATH)
+        members_data.update(latest_members)
 
         merged_today: dict[str, dict] = {}
-        # 1) 과거 기록에 있던 멤버들을 기본 0마디로 수집
+
+        # 1) 상시 멤버 목록의 모든 인원을 기본 0마디로 반영
+        for uid, m_info in members_data.items():
+            if not uid or not isinstance(m_info, dict):
+                continue
+            merged_today[uid] = {
+                "name": m_info.get("name") or uid[-6:],
+                "madit": 0,
+            }
+
+        # 2) 과거 날짜 기록에 있던 멤버도 기본 0마디로 보충
         for date_key, board in sorted(ranking_data.items()):
             if date_key == day or not isinstance(board, dict):
                 continue
             for uid, info in board.items():
-                if isinstance(info, dict):
-                    merged_today.setdefault(
-                        uid,
-                        {
-                            "name": info.get("name") or uid[-6:],
-                            "madit": 0,
-                        },
-                    )
+                if not uid or not isinstance(info, dict):
+                    continue
+                if uid not in merged_today:
+                    merged_today[uid] = {
+                        "name": info.get("name") or uid[-6:],
+                        "madit": 0,
+                    }
+                elif info.get("name") and merged_today[uid]["name"] == uid[-6:]:
+                    merged_today[uid]["name"] = info.get("name")
 
-        # 2) 오늘 날짜 보드 반영
+        # 3) 오늘 날짜 기록 반영
         day_board = ranking_data.get(day, {})
         if isinstance(day_board, dict):
             for uid, info in day_board.items():
-                if isinstance(info, dict):
-                    prev_name = merged_today.get(uid, {}).get("name") or uid[-6:]
-                    merged_today[uid] = {
-                        "name": info.get("name") or prev_name,
-                        "madit": int(info.get("madit", 0)),
-                    }
+                if not uid or not isinstance(info, dict):
+                    continue
+                prev_name = merged_today.get(uid, {}).get("name") or uid[-6:]
+                resolved_name = info.get("name") or prev_name
+                merged_today[uid] = {
+                    "name": resolved_name,
+                    "madit": int(info.get("madit", 0)),
+                }
 
         items = list(merged_today.items())
 
@@ -338,16 +412,17 @@ def format_my_ranking(user_id: str | None, fallback_name: str) -> str:
 
 def format_all_ranking(header_prefix: str = "🏆") -> str:
     day = today_key()
+    sync_group_members_from_api()
     sorted_items = get_sorted_today_entries()
 
     if not sorted_items:
         return (
             f"{header_prefix} [{day}] 전체 랭킹\n"
-            f"아직 등록된 멤버나 발언 기록이 없습니다."
+            f"아직 등록된 멤버가 없습니다."
         )
 
     lines = [
-        f"{header_prefix} [{day}] 전체 랭킹 (기준: {MIN_ACTIVITY_MADIT}마디 이상)"
+        f"{header_prefix} [{day}] 전체 랭킹 (총 {len(sorted_items)}명 · 기준: {MIN_ACTIVITY_MADIT}마디 이상)"
     ]
     for idx, (_, info) in enumerate(sorted_items, start=1):
         name = info.get("name") or "멤버"
@@ -452,6 +527,14 @@ def callback():
 @handler.add(MemberJoinedEvent)
 def handle_member_joined(event):
     register_chat_target(event)
+    joined_members = getattr(event.joined, "members", None) or []
+    group_id = getattr(event.source, "group_id", None)
+    room_id = getattr(event.source, "room_id", None)
+    for m in joined_members:
+        uid = getattr(m, "user_id", None)
+        if uid:
+            display_name = get_display_name_by_ids(uid, group_id=group_id, room_id=room_id)
+            ensure_known_member(uid, display_name)
     reply_messages(event.reply_token, [WELCOME_MSG])
 
 
@@ -462,12 +545,17 @@ def handle_message(event):
     user_id = getattr(event.source, "user_id", None)
     cmd = normalize_command(user_text)
 
+    if user_id:
+        name = get_display_name(event)
+        upsert_member(user_id, name)
+    else:
+        name = "익명"
+
     if cmd in ("/환찌", "/환츄"):
         reply_messages(event.reply_token, [HWAN_MSG])
         return
 
     if cmd == "/내랭킹":
-        name = get_display_name(event)
         ensure_known_member(user_id, name)
         reply_messages(event.reply_token, [format_my_ranking(user_id, name)])
         return
@@ -485,7 +573,6 @@ def handle_message(event):
                 return
             last_counted_at[user_id] = now_ts
 
-        name = get_display_name(event)
         total = add_speech_count(user_id, name, 1)
         logger.info("[SPEECH] counted user_id=%s name=%s total=%d text=%r", user_id, name, total, user_text)
 
