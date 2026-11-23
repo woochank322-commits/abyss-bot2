@@ -100,6 +100,26 @@ ranking_data = load_json_dict(RANKING_STORE_PATH)
 targets_data = load_json_dict(TARGETS_STORE_PATH)
 
 
+def is_valid_counted_message(text: str) -> bool:
+    """
+    '/'로 시작하지 않으며, 자음/모음 나열(ㅋㅋㅋ, ㅠㅠ 등)이나 특수문자/숫자 덩어리가 아닌
+    '3글자 이상'의 유효한 단어가 1개 이상 포함된 메시지인지 판별
+    """
+    stripped = text.strip()
+    if not stripped or stripped.startswith("/"):
+        return False
+
+    # 공백 기준으로 토큰 분리 후 구두점/이모지/기호 제거
+    tokens = stripped.split()
+    for token in tokens:
+        # 완성형 한글(가-힣) 또는 영문/숫자만 남긴 순수 단어 추출
+        cleaned = re.sub(r"[^가-힣A-Za-z0-9]", "", token)
+        if len(cleaned) >= 3:
+            return True
+
+    return False
+
+
 def register_chat_target(event):
     """자동 랭킹 전송 대상(group / room / user) 등록"""
     source = getattr(event, "source", None)
@@ -154,7 +174,8 @@ def get_display_name(event) -> str:
     return user_id[-6:] if user_id != "unknown" else "익명"
 
 
-def add_madit(user_id: str, name: str, amount: int = 1) -> int:
+def add_speech_count(user_id: str, name: str, amount: int = 1) -> int:
+    """오늘 날짜(KST) 기준 유효 발화 횟수 적립"""
     day = today_key()
     with state_lock:
         day_board = ranking_data.setdefault(day, {})
@@ -185,18 +206,18 @@ def format_my_ranking(user_id: str | None, fallback_name: str) -> str:
         return (
             f"📊 [{day}] 내 랭킹\n"
             f"• 닉네임: {fallback_name}\n"
-            f"• 내 마딧수: 0\n"
+            f"• 오늘 발언 수: 0마디\n"
             f"• 오늘 현재 순위: 기록 없음"
         )
 
     rank = None
-    my_madit = 0
+    my_count = 0
     my_name = fallback_name
 
     for idx, (uid, info) in enumerate(sorted_items, start=1):
         if uid == user_id:
             rank = idx
-            my_madit = int(info.get("madit", 0))
+            my_count = int(info.get("madit", 0))
             my_name = info.get("name") or fallback_name
             break
 
@@ -204,14 +225,14 @@ def format_my_ranking(user_id: str | None, fallback_name: str) -> str:
         return (
             f"📊 [{day}] 내 랭킹\n"
             f"• 닉네임: {my_name}\n"
-            f"• 내 마딧수: 0\n"
+            f"• 오늘 발언 수: 0마디\n"
             f"• 오늘 현재 순위: 기록 없음"
         )
 
     return (
         f"📊 [{day}] 내 랭킹\n"
         f"• 닉네임: {my_name}\n"
-        f"• 내 마딧수: {my_madit}\n"
+        f"• 오늘 발언 수: {my_count}마디\n"
         f"• 오늘 현재 순위: {rank}위 / {len(sorted_items)}명"
     )
 
@@ -221,14 +242,14 @@ def format_all_ranking(header_prefix: str = "🏆") -> str:
     sorted_items = get_sorted_today_entries()
 
     if not sorted_items:
-        return f"{header_prefix} [{day}] 전체 랭킹\n아직 오늘 기록된 마딧수가 없습니다."
+        return f"{header_prefix} [{day}] 전체 랭킹\n아직 오늘 기록된 발언이 없습니다."
 
     lines = [f"{header_prefix} [{day}] 전체 랭킹"]
     for idx, (_, info) in enumerate(sorted_items, start=1):
         name = info.get("name") or "멤버"
-        madit = int(info.get("madit", 0))
+        count = int(info.get("madit", 0))
         medal = "🥇" if idx == 1 else ("🥈" if idx == 2 else ("🥉" if idx == 3 else f"{idx}."))
-        lines.append(f"{medal} {name} — {madit}마딧")
+        lines.append(f"{medal} {name} — {count}마디")
 
     return "\n".join(lines)
 
@@ -340,14 +361,12 @@ def handle_message(event):
         reply_messages(event.reply_token, [format_all_ranking()])
         return
 
-    # '마딧' 적립 감지 (예: '마딧', '마딧 +2', '마딧 3' 등)
-    if user_id and "마딧" in user_text and not user_text.startswith("/"):
-        num_match = re.search(r"마딧\s*\+?\s*(\d+)", user_text)
-        amount = int(num_match.group(1)) if num_match else 1
-        if amount > 0:
-            name = get_display_name(event)
-            total = add_madit(user_id, name, amount)
-            logger.info("[MADIT] user_id=%s name=%s +%d -> %d", user_id, name, amount, total)
+    if user_id and is_valid_counted_message(user_text):
+        name = get_display_name(event)
+        total = add_speech_count(user_id, name, 1)
+        logger.info("[SPEECH] counted user_id=%s name=%s total=%d text=%r", user_id, name, total, user_text)
+    else:
+        logger.debug("[SPEECH] ignored text=%r", user_text)
 
 
 if __name__ == "__main__":
