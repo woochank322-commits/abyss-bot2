@@ -25,6 +25,7 @@ from linebot.v3.webhooks import (
     MessageEvent,
     TextMessageContent,
     MemberJoinedEvent,
+    MemberLeftEvent,
 )
 
 load_dotenv()
@@ -234,6 +235,43 @@ def upsert_member(user_id: str | None, name: str | None = None):
         save_json_dict(MEMBERS_STORE_PATH, members_data)
 
 
+def remove_member(user_id: str | None, remove_today_ranking: bool = True):
+    """퇴장한 멤버를 상시 멤버 목록 및 오늘 랭킹에서 자동 제외"""
+    if not user_id:
+        return
+    day = today_key()
+    with state_lock:
+        latest_members = load_json_dict(MEMBERS_STORE_PATH)
+        members_data.clear()
+        members_data.update(latest_members)
+        removed_name = (members_data.pop(user_id, {}) or {}).get("name")
+        members_changed = removed_name is not None or user_id in latest_members
+        if members_changed:
+            save_json_dict(MEMBERS_STORE_PATH, members_data)
+
+        ranking_changed = False
+        if remove_today_ranking:
+            latest_rank = load_json_dict(RANKING_STORE_PATH)
+            ranking_data.clear()
+            ranking_data.update(latest_rank)
+            day_board = ranking_data.get(day)
+            if isinstance(day_board, dict) and user_id in day_board:
+                rank_info = day_board.pop(user_id, None)
+                if not removed_name and isinstance(rank_info, dict):
+                    removed_name = rank_info.get("name")
+                ranking_changed = True
+                save_json_dict(RANKING_STORE_PATH, ranking_data)
+
+        if members_changed or ranking_changed:
+            logger.info(
+                "[MEMBER_LEFT] removed user_id=%s name=%s (members=%s, today_ranking=%s)",
+                user_id,
+                removed_name or user_id[-6:],
+                members_changed,
+                ranking_changed,
+            )
+
+
 def sync_group_members_from_api():
     """가능한 경우 그룹 멤버 ID 목록을 조회해 미등록 멤버(0마디)도 보충"""
     targets = get_chat_targets()
@@ -305,7 +343,7 @@ def add_speech_count(user_id: str, name: str, amount: int = 1) -> int:
 
 def get_sorted_today_entries() -> list[tuple[str, dict]]:
     """
-    방 안에서 인지된 모든 인원(오늘 0마디 포함)을 합쳐 오늘 발언 수 기준 내림차순 정렬
+    현재 방에 남아 있는 멤버(오늘 0마디 포함) 기준으로 오늘 발언 수 내림차순 정렬
     """
     day = today_key()
     with state_lock:
@@ -313,10 +351,12 @@ def get_sorted_today_entries() -> list[tuple[str, dict]]:
         ranking_data.update(latest_rank)
 
         latest_members = load_json_dict(MEMBERS_STORE_PATH)
+        members_data.clear()
         members_data.update(latest_members)
 
         merged_today: dict[str, dict] = {}
 
+        # 상시 멤버 목록에 있는 현재 재실 인원을 기준으로 구성
         for uid, m_info in members_data.items():
             if not uid or not isinstance(m_info, dict):
                 continue
@@ -325,26 +365,13 @@ def get_sorted_today_entries() -> list[tuple[str, dict]]:
                 "madit": 0,
             }
 
-        for date_key, board in sorted(ranking_data.items()):
-            if date_key == day or not isinstance(board, dict):
-                continue
-            for uid, info in board.items():
-                if not uid or not isinstance(info, dict):
-                    continue
-                if uid not in merged_today:
-                    merged_today[uid] = {
-                        "name": info.get("name") or uid[-6:],
-                        "madit": 0,
-                    }
-                elif info.get("name") and merged_today[uid]["name"] == uid[-6:]:
-                    merged_today[uid]["name"] = info.get("name")
-
+        # 오늘 날짜 기록 중 현재 멤버 목록에 속한 인원의 마디 수 반영
         day_board = ranking_data.get(day, {})
         if isinstance(day_board, dict):
             for uid, info in day_board.items():
-                if not uid or not isinstance(info, dict):
+                if not uid or not isinstance(info, dict) or uid not in merged_today:
                     continue
-                prev_name = merged_today.get(uid, {}).get("name") or uid[-6:]
+                prev_name = merged_today[uid].get("name") or uid[-6:]
                 resolved_name = info.get("name") or prev_name
                 merged_today[uid] = {
                     "name": resolved_name,
@@ -540,55 +567,16 @@ def handle_member_joined(event):
     reply_messages(event.reply_token, [WELCOME_MSG])
 
 
+@handler.add(MemberLeftEvent)
+def handle_member_left(event):
+    register_chat_target(event)
+    left_members = getattr(event.left, "members", None) or []
+    for m in left_members:
+        uid = getattr(m, "user_id", None)
+        remove_member(uid, remove_today_ranking=True)
+
+
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event):
     register_chat_target(event)
-    user_text = event.message.text.strip()
-    user_id = getattr(event.source, "user_id", None)
-    cmd = normalize_command(user_text)
-
-    if user_id:
-        name = get_display_name(event)
-        upsert_member(user_id, name)
-    else:
-        name = "익명"
-
-    if cmd in ("/환찌", "/환츄"):
-        reply_messages(event.reply_token, [HWAN_MSG])
-        return
-
-    if cmd == "/내랭킹":
-        ensure_known_member(user_id, name)
-        reply_messages(event.reply_token, [format_my_ranking(user_id, name)])
-        return
-
-    if cmd == "/전체랭킹":
-        reply_messages(event.reply_token, [format_all_ranking()])
-        return
-
-    if user_id:
-        gained_madit = calculate_message_madit(user_text)
-        if gained_madit > 0:
-            now_ts = time.monotonic()
-            with state_lock:
-                prev_ts = last_counted_at.get(user_id, 0.0)
-                if MIN_SPEECH_INTERVAL_SEC > 0 and (now_ts - prev_ts) < MIN_SPEECH_INTERVAL_SEC:
-                    logger.info("[SPEECH] rate-limited user_id=%s text=%r", user_id, user_text)
-                    return
-                last_counted_at[user_id] = now_ts
-
-            total = add_speech_count(user_id, name, gained_madit)
-            logger.info(
-                "[SPEECH] counted user_id=%s name=%s +%d (total=%d) text=%r",
-                user_id,
-                name,
-                gained_madit,
-                total,
-                user_text,
-            )
-
-
-if __name__ == "__main__":
-    ensure_scheduler_started()
-    port = int(os.getenv("PORT", 8000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    user
